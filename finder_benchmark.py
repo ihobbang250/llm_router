@@ -25,7 +25,7 @@ Answer:
 """
 
 # ────────────── Load FinDER Dataset ──────────────
-def load_finder_dataset(split: str = "train", num_samples: int = None, seed: int = 42, random_sample: bool = True):
+def load_finder_dataset(split: str = "train", num_samples: int = None, seed: int = 42, random_sample: bool = True, filter_ids: List[str] = None):
     """
     Load FinDER dataset from Hugging Face
     
@@ -34,6 +34,7 @@ def load_finder_dataset(split: str = "train", num_samples: int = None, seed: int
         num_samples: Number of samples to load (None for all)
         seed: Random seed for reproducible sampling
         random_sample: If True, randomly sample `num_samples` with the given seed
+        filter_ids: List of IDs to filter the dataset by. If provided, num_samples is ignored.
     
     Returns:
         Dataset object
@@ -41,7 +42,15 @@ def load_finder_dataset(split: str = "train", num_samples: int = None, seed: int
     print(f"Loading FinDER dataset (split: {split})...")
     dataset = load_dataset("Linq-AI-Research/FinDER", split=split)
 
-    if num_samples:
+    if filter_ids:
+        print(f"Filtering dataset by {len(filter_ids)} IDs...")
+        filter_ids_set = set(filter_ids)
+        # Filter dataset to include only samples with IDs in the list
+        # Try '_id' first (FinDER dataset usually uses this), then 'id'
+        dataset = dataset.filter(lambda x: (x.get('_id') or x.get('id')) in filter_ids_set)
+        
+        print(f"Filtered dataset size: {len(dataset)}")
+    elif num_samples:
         if random_sample:
             # Shuffle deterministically with seed, then take head
             print(f"Randomly sampling {num_samples} examples with seed={seed}")
@@ -53,6 +62,30 @@ def load_finder_dataset(split: str = "train", num_samples: int = None, seed: int
     
     print(f"Loaded {len(dataset)} samples")
     return dataset
+
+# ────────────── Helper: Get IDs from CSV ──────────────
+def get_ids_from_csv(file_path: str) -> List[str]:
+    """
+    Read IDs from a CSV file.
+    Expects an 'id' column in the CSV.
+    """
+    import csv
+    ids = set()
+    try:
+        # Use utf-8-sig to handle potential BOM
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            # Normalize headers (strip whitespace)
+            if reader.fieldnames:
+                reader.fieldnames = [name.strip() for name in reader.fieldnames]
+            
+            for row in reader:
+                if 'id' in row and row['id']:
+                    ids.add(row['id'].strip())
+    except Exception as e:
+        print(f"Error reading ID file {file_path}: {e}")
+    
+    return list(ids)
 
 # ────────────── Create Prompt ──────────────
 def create_prompt(question: str, reference: str) -> str:
@@ -76,7 +109,8 @@ def process_sample(
     sample_data: tuple,
     model_client,
     question_field: str,
-    reference_field: str
+    reference_field: str,
+    max_tokens: float = 10
 ) -> Dict[str, Any]:
     """
     Process a single sample
@@ -86,6 +120,7 @@ def process_sample(
         model_client: LLM client instance
         question_field: Field name for question
         reference_field: Field name for reference
+        max_tokens: Max tokens for generation (int or float for percentage)
     
     Returns:
         Result dictionary
@@ -108,7 +143,10 @@ def process_sample(
         start_time = time.time()
         
         # Get response from LLM
-        response = model_client.get_response(prompt)
+        if isinstance(model_client, TogetherClient):
+            response = model_client.get_response(prompt, max_tokens=max_tokens)
+        else:
+            response = model_client.get_response(prompt)
         
         # Calculate latency
         latency = time.time() - start_time
@@ -124,7 +162,9 @@ def process_sample(
             "output_tokens": model_client.last_output_tokens,
             "cost": model_client.last_call_cost,
             "latency": round(latency, 3),
-            "ttft": model_client.last_ttft
+            "ttft": model_client.last_ttft,
+            "seq_prob": model_client.last_seq_prob,
+            "seq_logprob": model_client.last_seq_logprob
         }
         
         # Add reasoning if available
@@ -165,7 +205,8 @@ def run_benchmark(
     output_file: str,
     question_field: str = "question",
     reference_field: str = "context",
-    max_workers: int = 1
+    max_workers: int = 1,
+    max_tokens: float = 10
 ):
     """
     Run benchmark on FinDER dataset and save results to JSON
@@ -177,6 +218,7 @@ def run_benchmark(
         question_field: Field name for question in dataset
         reference_field: Field name for reference/context in dataset
         max_workers: Number of parallel workers (1 for sequential)
+        max_tokens: Max tokens for generation (int or float for percentage)
     """
     results = []
     total_cost = 0.0
@@ -186,6 +228,7 @@ def run_benchmark(
     print(f"\nRunning benchmark with {model_client.model_id}...")
     print(f"Total samples: {len(dataset)}")
     print(f"Max workers: {max_workers}")
+    print(f"Max tokens: {max_tokens}")
     print(f"Output file: {output_file}\n")
     
     # Prepare sample data
@@ -194,7 +237,7 @@ def run_benchmark(
     if max_workers == 1:
         # Sequential processing
         for data in tqdm(sample_data, desc="Processing"):
-            result = process_sample(data, model_client, question_field, reference_field)
+            result = process_sample(data, model_client, question_field, reference_field, max_tokens)
             if result:
                 with results_lock:
                     results.append(result)
@@ -209,7 +252,7 @@ def run_benchmark(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_sample = {
-                executor.submit(process_sample, data, model_client, question_field, reference_field): data[0]
+                executor.submit(process_sample, data, model_client, question_field, reference_field, max_tokens): data[0]
                 for data in sample_data
             }
             
@@ -288,6 +331,8 @@ def main():
                        help="Number of samples to process (None for all)")
     parser.add_argument("--temperature", type=float, default=0.6,
                        help="Temperature for generation")
+    parser.add_argument("--max-tokens", type=float, default=10,
+                       help="Max tokens for generation (default: 10). If < 1.0, treated as percentage of input tokens.")
     parser.add_argument("--output-dir", type=str, default="results",
                        help="Output directory for results")
     parser.add_argument("--split", type=str, default="train",
@@ -298,6 +343,8 @@ def main():
                        help="Random seed for reproducibility")
     parser.add_argument("--random-sample", action="store_true",
                        help="Randomly sample num_samples with the given seed (default: take first N)")
+    parser.add_argument("--id-file", type=str, default=None,
+                       help="CSV file containing 'id' column to filter samples. Overrides num-samples.")
     
     args = parser.parse_args()
     
@@ -309,11 +356,22 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Determine if we should filter by IDs
+    filter_ids = None
+    if args.id_file and os.path.exists(args.id_file):
+        print(f"Found ID file: {args.id_file}")
+        filter_ids = get_ids_from_csv(args.id_file)
+    elif os.path.exists("result.csv"):
+        print(f"Found result.csv, using IDs from it.")
+        filter_ids = get_ids_from_csv("result.csv")
+
     # Load dataset
     dataset = load_finder_dataset(
         split=args.split,
         num_samples=args.num_samples,
         seed=args.seed,
+        random_sample=args.random_sample, # Need to pass this
+        filter_ids=filter_ids
     )
     
     # Create model client based on API provider
@@ -344,7 +402,8 @@ def main():
             output_file=output_file,
             question_field="text",  # FinDER dataset uses 'text' field
             reference_field="references",   # FinDER dataset uses 'references' field
-            max_workers=args.max_workers
+            max_workers=args.max_workers,
+            max_tokens=args.max_tokens
         )
     except Exception as e:
         print(f"Error running benchmark for {model_client.model_id}: {e}")

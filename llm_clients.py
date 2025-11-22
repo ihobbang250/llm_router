@@ -1,5 +1,7 @@
 import os
 import time
+import math
+from typing import Union
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
 from utils import get_short_model_prefix
@@ -26,14 +28,17 @@ PRICING = {
 
     # Together AI / DeepSeek
     "deepseek-ai/DeepSeek-V3": {"input": 1.25, "output": 1.25},
+    "deepseek-ai/DeepSeek-V3.1": {"input": 0.60, "output": 1.7},
     "Qwen/Qwen3-235B-A22B-Instruct-2507-tput": {"input": 0.20, "output": 0.60},
     "Qwen/Qwen3-235B-A22B-Thinking-2507": {"input": 0.65, "output": 3.00},
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {"input": 0.18, "output": 0.59},
     "mistralai/Mistral-Small-24B-Instruct-2501": {"input": 0.80, "output": 0.80},
     "zai-org/GLM-4.5-Air-FP8": {"input": 0.20, "output": 1.10},
+    "zai-org/GLM-4.6": {"input": 0.60, "output": 2.20},
     "Qwen/Qwen3-Next-80B-A3B-Thinking" : {"input": 0.15, "output": 1.50},
     "Qwen/Qwen3-Next-80B-A3B-Instruct" : {"input": 0.15, "output": 1.50},
     "openai/gpt-oss-120b": {"input": 0.15, "output": 0.60},
+    "moonshotai/Kimi-K2-Instruct-0905": {"input": 1.00, "output": 3.00},
     # XAI
     "grok-4-fast-non-reasoning": {"input": 3.00, "output": 15.00},
 }
@@ -48,6 +53,8 @@ class LLMClient(ABC):
         self.last_input_tokens = 0
         self.last_output_tokens = 0
         self.last_ttft = 0.0  # Time to first token
+        self.last_seq_prob = []
+        self.last_seq_logprob = []
 
     @abstractmethod
     def get_response(self, prompt: str) -> str:
@@ -75,8 +82,10 @@ class OpenAIClient(LLMClient):
         self.last_input_tokens = 0
         self.last_output_tokens = 0
         self.last_ttft = 0.0
-        
+        self.last_seq_prob = []
+        self.last_seq_logprob = []
         last_error = None
+        
         for attempt in range(MAX_RETRIES):
             try:
                 start_time = time.time()
@@ -161,6 +170,8 @@ class GeminiClient(LLMClient):
         self.last_input_tokens = 0
         self.last_output_tokens = 0
         self.last_ttft = 0.0
+        self.last_seq_prob = []
+        self.last_seq_logprob = []
         last_error = None
         
         for attempt in range(1, MAX_RETRIES + 1):
@@ -210,41 +221,91 @@ class TogetherClient(LLMClient):
             raise ValueError("TOGETHER_API_KEY environment variable not set")
         self.client = Together(api_key=api_key)
 
-    def get_response(self, prompt: str) -> str:
+    def get_response(self, prompt: str, max_tokens: Union[int, float] = 5) -> str:
         self.last_call_cost = 0.0
         self.last_input_tokens = 0
         self.last_output_tokens = 0
         self.last_ttft = 0.0
+        self.last_seq_prob = []
+        self.last_seq_logprob = []
         last_error = None
+        
+        # Calculate max_tokens if it's a percentage
+        if isinstance(max_tokens, float) and 0 < max_tokens < 1:
+             # Estimate input tokens (rough estimate: 1 token ~= 4 chars)
+             estimated_input_tokens = len(prompt) // 4
+             calculated_max_tokens = int(estimated_input_tokens * max_tokens)
+             # Ensure at least 1 token
+             max_tokens = max(1, calculated_max_tokens)
+        else:
+             max_tokens = int(max_tokens)
         
         for attempt in range(MAX_RETRIES):
             try:
                 start_time = time.time()
-                first_token_received = False
                 full_response = ""
                 
-                stream = self.client.chat.completions.create(
+                # Use non-streaming to get logprobs as per documentation
+                completion = self.client.chat.completions.create(
                     model=self.model_id,
                     messages=[{"role": "user", "content": prompt}],
-                    stream=True,
+                    max_tokens=max_tokens,
+                    logprobs=1,
                 )
                 
-                for chunk in stream:
-                    if not first_token_received and chunk.choices and chunk.choices[0].delta.content:
-                        self.last_ttft = time.time() - start_time
-                        first_token_received = True
+                self.last_ttft = time.time() - start_time
+                
+                if completion.choices:
+                    choice = completion.choices[0]
+                    full_response = choice.message.content or ""
                     
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        full_response += chunk.choices[0].delta.content
+                    # Extract logprobs and convert to probabilities
+                    if hasattr(choice, 'logprobs') and choice.logprobs:
+                        # Check for 'content' field (new format)
+                        if hasattr(choice.logprobs, 'content') and choice.logprobs.content:
+                            self.last_seq_prob = []
+                            self.last_seq_logprob = []
+                            for item in choice.logprobs.content:
+                                lp = None
+                                if isinstance(item, dict):
+                                    lp = item.get('logprob')
+                                elif hasattr(item, 'logprob'):
+                                    lp = item.logprob
+                                
+                                if lp is not None:
+                                    self.last_seq_prob.append(math.exp(lp))
+                                    self.last_seq_logprob.append(lp)
+                                else:
+                                    self.last_seq_prob.append(0.0)
+                                    self.last_seq_logprob.append(None)
+                        # Check for 'token_logprobs' field (old format)
+                        elif hasattr(choice.logprobs, 'token_logprobs') and choice.logprobs.token_logprobs:
+                            self.last_seq_prob = [
+                                math.exp(lp) if lp is not None else 0.0 
+                                for lp in choice.logprobs.token_logprobs
+                            ]
+                            self.last_seq_logprob = list(choice.logprobs.token_logprobs)
+                    
+                    # If content is empty but reasoning exists (e.g. for thinking models), use reasoning content
+                    if not full_response and hasattr(choice.message, 'reasoning') and choice.message.reasoning:
+                        full_response = choice.message.reasoning
                 
-                # Get token count from non-streaming call (Together doesn't provide usage in streaming)
-                # Estimate based on response length
-                self.last_input_tokens = len(prompt) // 4  # Rough estimate
-                self.last_output_tokens = len(full_response) // 4  # Rough estimate
-                self.last_call_cost = self.calculate_cost(
-                    self.last_input_tokens,
-                    self.last_output_tokens
-                )
+                # Get usage
+                if hasattr(completion, 'usage') and completion.usage:
+                    self.last_input_tokens = completion.usage.prompt_tokens
+                    self.last_output_tokens = completion.usage.completion_tokens
+                    self.last_call_cost = self.calculate_cost(
+                        self.last_input_tokens,
+                        self.last_output_tokens
+                    )
+                else:
+                    # Fallback estimate
+                    self.last_input_tokens = len(prompt) // 4
+                    self.last_output_tokens = len(full_response) // 4
+                    self.last_call_cost = self.calculate_cost(
+                        self.last_input_tokens,
+                        self.last_output_tokens
+                    )
                 
                 if full_response:
                     return full_response.strip()
@@ -269,6 +330,8 @@ class AnthropicClient(LLMClient):
         self.last_input_tokens = 0
         self.last_output_tokens = 0
         self.last_ttft = 0.0
+        self.last_seq_prob = []
+        self.last_seq_logprob = []
         last_error = None
         
         for attempt in range(MAX_RETRIES):
@@ -324,6 +387,8 @@ class XAIClient(LLMClient):
         self.last_input_tokens = 0
         self.last_output_tokens = 0
         self.last_ttft = 0.0
+        self.last_seq_prob = []
+        self.last_seq_logprob = []
         last_error = None
         
         for attempt in range(MAX_RETRIES):

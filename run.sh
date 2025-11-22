@@ -9,14 +9,17 @@
 set -e
 
 # Parse arguments
-API_PROVIDER=${1:-"gemini"}
-MODEL_ID=${2:-"gemini-2.5-pro"}
-NUM_SAMPLES=${3:-1000}
-MAX_WORKERS=${5:-20}
+API_PROVIDER=${1:-"together"}
+MODEL_ID=${2:-"openai/gpt-oss-120b"}
+NUM_SAMPLES=${3:-5}
+MAX_TOKENS=${4:-50}
+MAX_WORKERS=${5:-30}
 
 # Run benchmark
 python finder_benchmark.py \
     --api "$API_PROVIDER" \
     --model-id "$MODEL_ID" \
     --num-samples "$NUM_SAMPLES" \
-    --max-workers "$MAX_WORKERS"
+    --max-tokens "$MAX_TOKENS" \
+    --max-workers "$MAX_WORKERS" \
+    --output-dir "exp_results"
